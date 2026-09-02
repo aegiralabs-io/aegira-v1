@@ -13,6 +13,7 @@ const INCIDENT_LOG_PATH: &str = "/var/log/aegira/incident.log";
 
 const BUILTIN_RULES_DIR: &str = "/etc/aegira/rules/builtin";
 const CUSTOM_RULES_DIR: &str = "/etc/aegira/rules/custom";
+const CONFIG_PATH: &str = "/etc/aegira/config.json";
 
 const POLL_INTERVAL_SECS: u64 = 2;
 const RULE_RELOAD_INTERVAL_SECS: u64 = 10;
@@ -24,6 +25,97 @@ const MAX_INCIDENT_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
 const MIN_MATCH_SCORE: i32 = 60;
 const SELF_SERVICE: &str = "aegira";
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct AegiraConfig {
+    #[serde(default)]
+    target_service: Option<String>,
+    #[serde(default)]
+    target_container: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuleFileFingerprint {
+    files: Vec<(String, u64, u64)>,
+}
+
+fn load_config() -> Result<AegiraConfig, String> {
+    match fs::read_to_string(CONFIG_PATH) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .map_err(|e| format!("Invalid Aegira config: {}", e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AegiraConfig::default()),
+        Err(e) => Err(format!("Failed to read {}: {}", CONFIG_PATH, e)),
+    }
+}
+
+fn save_config(config: &AegiraConfig) -> Result<(), String> {
+    let target_service = match &config.target_service {
+        Some(value) => format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\"")),
+        None => "null".to_string(),
+    };
+    let target_container = match &config.target_container {
+        Some(value) => format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\"")),
+        None => "null".to_string(),
+    };
+    let contents = format!(
+        "{{\n  \"target_service\": {},\n  \"target_container\": {}\n}}\n",
+        target_service, target_container
+    );
+    fs::write(CONFIG_PATH, contents)
+        .map_err(|e| format!("Failed to write {}: {}", CONFIG_PATH, e))
+}
+
+fn normalize_target(value: &str) -> String {
+    value.trim().trim_end_matches(".service").to_lowercase()
+}
+
+fn resolve_service_target(service: &str) -> Result<String, String> {
+    if service.trim() != "TARGET_SERVICE" {
+        return Ok(service.trim().to_string());
+    }
+    let config = load_config()?;
+    let target = config.target_service
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "No target service configured. Run: sudo aegira configure service <service>".to_string())?;
+    if normalize_target(&target) == SELF_SERVICE {
+        return Err("Refusing to target Aegira itself.".to_string());
+    }
+    Ok(target.trim().to_string())
+}
+
+fn resolve_container_target(container: &str) -> Result<String, String> {
+    if container.trim() != "TARGET_CONTAINER" {
+        return Ok(container.trim().to_string());
+    }
+    let config = load_config()?;
+    config.target_container
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .ok_or_else(|| "No target container configured. Run: sudo aegira configure container <container>".to_string())
+}
+
+fn get_rule_fingerprint() -> RuleFileFingerprint {
+    let mut files = Vec::new();
+    for dir in [BUILTIN_RULES_DIR, CUSTOM_RULES_DIR] {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|v| v.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(metadata) = fs::metadata(&path) {
+                    let modified = metadata.modified().ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs().saturating_mul(1_000_000_000) + d.subsec_nanos() as u64)
+                        .unwrap_or(0);
+                    files.push((path.to_string_lossy().into_owned(), metadata.len(), modified));
+                }
+            }
+        }
+    }
+    files.sort();
+    RuleFileFingerprint { files }
+}
 
 #[derive(Debug, Deserialize, Clone)]
 struct Rule {
@@ -645,192 +737,92 @@ fn execute_command(
     }
 }
 
-fn perform_remediation(
-    remediation: &Remediation,
-) -> Result<(), String> {
+fn perform_remediation(remediation: &Remediation) -> Result<(), String> {
     match remediation {
         Remediation::ServiceRestart { service } => {
-            let normalized =
-                service
-                    .trim()
-                    .trim_end_matches(".service")
-                    .to_lowercase();
-
-            if normalized == SELF_SERVICE {
-                return Err(
-                    "Refusing remediation: rule attempts to restart Aegira itself"
-                        .to_string(),
-                );
+            let target = resolve_service_target(service)?;
+            if normalize_target(&target) == SELF_SERVICE {
+                return Err("Refusing remediation: rule attempts to restart Aegira itself".to_string());
             }
-
-            let systemctl =
-                systemctl_binary()?;
-
-            log_incident(&format!(
-                "[RECOVERY] Restarting service: {}",
-                service
-            ));
-
-            execute_command(
-                systemctl,
-                &["restart", service.trim()],
-            )
+            let systemctl = systemctl_binary()?;
+            log_incident(&format!("[RECOVERY] Restarting service: {}", target));
+            execute_command(systemctl, &["restart", target.as_str()])
         }
-
         Remediation::ContainerRestart { container } => {
-            let docker =
-                docker_binary()?;
-
-            log_incident(&format!(
-                "[RECOVERY] Restarting container: {}",
-                container
-            ));
-
-            execute_command(
-                docker,
-                &["restart", container.trim()],
-            )
+            let target = resolve_container_target(container)?;
+            let docker = docker_binary()?;
+            log_incident(&format!("[RECOVERY] Restarting container: {}", target));
+            execute_command(docker, &["restart", target.as_str()])
         }
     }
 }
 
-fn verify_recovery(
-    verification: &Verification,
-) -> bool {
+fn verify_recovery(verification: &Verification) -> bool {
     match verification {
         Verification::None => {
-            log_incident(
-                "[VERIFY] No verification required",
-            );
-
+            log_incident("[VERIFY] No verification required");
             true
         }
-
         Verification::ServiceActive { service } => {
-            let systemctl =
-                match systemctl_binary() {
-                    Ok(path) => path,
-
-                    Err(e) => {
-                        log_incident(
-                            &format!(
-                                "[VERIFY ERROR] {}",
-                                e
-                            )
-                        );
-
-                        return false;
-                    }
-                };
-
-            log_incident(&format!(
-                "[VERIFY] Checking service: {}",
-                service
-            ));
-
-            match Command::new(systemctl)
-                .args([
-                    "is-active",
-                    service.trim(),
-                ])
-                .output()
-            {
+            let target = match resolve_service_target(service) {
+                Ok(target) => target,
+                Err(e) => {
+                    log_incident(&format!("[VERIFY ERROR] {}", e));
+                    return false;
+                }
+            };
+            let systemctl = match systemctl_binary() {
+                Ok(path) => path,
+                Err(e) => {
+                    log_incident(&format!("[VERIFY ERROR] {}", e));
+                    return false;
+                }
+            };
+            log_incident(&format!("[VERIFY] Checking service: {}", target));
+            match Command::new(systemctl).args(["is-active", target.as_str()]).output() {
                 Ok(output) => {
-                    let active =
-                        output.status.success()
-                            && String::from_utf8_lossy(
-                                &output.stdout,
-                            )
-                            .trim()
-                            == "active";
-
+                    let active = output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "active";
                     if active {
-                        log_incident(
-                            "[VERIFY] Service is active",
-                        );
+                        log_incident("[VERIFY] Service is active");
                     } else {
-                        log_incident(
-                            "[VERIFY] Service is NOT active",
-                        );
+                        log_incident("[VERIFY] Service is NOT active");
                     }
-
                     active
                 }
-
                 Err(e) => {
-                    log_incident(
-                        &format!(
-                            "[VERIFY ERROR] {}",
-                            e
-                        )
-                    );
-
+                    log_incident(&format!("[VERIFY ERROR] {}", e));
                     false
                 }
             }
         }
-
         Verification::ContainerRunning { container } => {
-            let docker =
-                match docker_binary() {
-                    Ok(path) => path,
-
-                    Err(e) => {
-                        log_incident(
-                            &format!(
-                                "[VERIFY ERROR] {}",
-                                e
-                            )
-                        );
-
-                        return false;
-                    }
-                };
-
-            log_incident(&format!(
-                "[VERIFY] Checking container: {}",
-                container
-            ));
-
-            match Command::new(docker)
-                .args([
-                    "inspect",
-                    "-f",
-                    "{{.State.Running}}",
-                    container.trim(),
-                ])
-                .output()
-            {
+            let target = match resolve_container_target(container) {
+                Ok(target) => target,
+                Err(e) => {
+                    log_incident(&format!("[VERIFY ERROR] {}", e));
+                    return false;
+                }
+            };
+            let docker = match docker_binary() {
+                Ok(path) => path,
+                Err(e) => {
+                    log_incident(&format!("[VERIFY ERROR] {}", e));
+                    return false;
+                }
+            };
+            log_incident(&format!("[VERIFY] Checking container: {}", target));
+            match Command::new(docker).args(["inspect", "-f", "{{.State.Running}}", target.as_str()]).output() {
                 Ok(output) => {
-                    let running =
-                        output.status.success()
-                            && String::from_utf8_lossy(
-                                &output.stdout,
-                            )
-                            .trim()
-                            == "true";
-
+                    let running = output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true";
                     if running {
-                        log_incident(
-                            "[VERIFY] Container is running",
-                        );
+                        log_incident("[VERIFY] Container is running");
                     } else {
-                        log_incident(
-                            "[VERIFY] Container is NOT running",
-                        );
+                        log_incident("[VERIFY] Container is NOT running");
                     }
-
                     running
                 }
-
                 Err(e) => {
-                    log_incident(
-                        &format!(
-                            "[VERIFY ERROR] {}",
-                            e
-                        )
-                    );
-
+                    log_incident(&format!("[VERIFY ERROR] {}", e));
                     false
                 }
             }
@@ -1046,6 +1038,8 @@ fn print_usage() {
     println!("  aegira install");
     println!("  aegira status");
     println!("  aegira show-rules");
+    println!("  aegira configure service <name>");
+    println!("  aegira configure container <name>");
     println!("  aegira run");
 }
 
@@ -1056,17 +1050,15 @@ fn run_monitor() {
     }
 
     let aegira_dir = get_aegira_dir();
-
     log_incident("[INFO] Aegira Recovery Engine Started");
     log_incident(&format!("[INFO] Aegira directory: {}", aegira_dir.display()));
     log_incident(&format!("[INFO] Monitoring log: {}", LOG_FILE_PATH));
 
     let mut rules = load_all_rules();
+    let mut rule_fingerprint = get_rule_fingerprint();
     log_incident(&format!("[INFO] {} remediation rules ready", rules.len()));
 
-    let mut last_rule_reload = Instant::now();
     let log_path = Path::new(LOG_FILE_PATH);
-
     let mut position = match fs::metadata(log_path) {
         Ok(metadata) => metadata.len(),
         Err(e) => {
@@ -1074,7 +1066,6 @@ fn run_monitor() {
             return;
         }
     };
-
     let mut file_identity = match get_file_identity(log_path) {
         Ok(identity) => identity,
         Err(e) => {
@@ -1082,16 +1073,18 @@ fn run_monitor() {
             return;
         }
     };
-
     let mut cooldowns: HashMap<String, Instant> = HashMap::new();
-
     log_incident("[INFO] Monitoring new log entries...");
 
     loop {
-        if last_rule_reload.elapsed() >= Duration::from_secs(RULE_RELOAD_INTERVAL_SECS) {
-            rules = load_all_rules();
-            last_rule_reload = Instant::now();
-            log_incident(&format!("[RULES] Rules reloaded: {} active", rules.len()));
+        let current_fingerprint = get_rule_fingerprint();
+        if current_fingerprint != rule_fingerprint {
+            let new_rules = load_all_rules();
+            if !new_rules.is_empty() {
+                rules = new_rules;
+                rule_fingerprint = current_fingerprint;
+                log_incident(&format!("[RULES] Rules changed. Reloaded: {} active", rules.len()));
+            }
         }
 
         let metadata = match fs::metadata(log_path) {
@@ -1102,7 +1095,6 @@ fn run_monitor() {
                 continue;
             }
         };
-
         let current_identity = match get_file_identity(log_path) {
             Ok(identity) => identity,
             Err(e) => {
@@ -1111,7 +1103,6 @@ fn run_monitor() {
                 continue;
             }
         };
-
         let file_size = metadata.len();
 
         if current_identity != file_identity {
@@ -1123,54 +1114,44 @@ fn run_monitor() {
             position = 0;
         }
 
-        if file_size <= position {
-            sleep(Duration::from_secs(POLL_INTERVAL_SECS));
-            continue;
-        }
-
-        let file = match File::open(log_path) {
-            Ok(file) => file,
-            Err(e) => {
-                log_incident(&format!("[LOG ERROR] Failed opening monitored log: {}", e));
+        if file_size > position {
+            let file = match File::open(log_path) {
+                Ok(file) => file,
+                Err(e) => {
+                    log_incident(&format!("[LOG ERROR] Failed opening monitored log: {}", e));
+                    sleep(Duration::from_secs(POLL_INTERVAL_SECS));
+                    continue;
+                }
+            };
+            let mut reader = BufReader::new(file);
+            if let Err(e) = reader.seek(SeekFrom::Start(position)) {
+                log_incident(&format!("[LOG ERROR] Failed seeking monitored log: {}", e));
                 sleep(Duration::from_secs(POLL_INTERVAL_SECS));
                 continue;
             }
-        };
 
-        let mut reader = BufReader::new(file);
-
-        if let Err(e) = reader.seek(SeekFrom::Start(position)) {
-            log_incident(&format!("[LOG ERROR] Failed seeking monitored log: {}", e));
-            sleep(Duration::from_secs(POLL_INTERVAL_SECS));
-            continue;
-        }
-
-        loop {
-            let line_start = position;
-            let mut line = String::new();
-
-            let bytes_read = match reader.read_line(&mut line) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    log_incident(&format!("[LOG ERROR] Failed reading monitored log: {}", e));
+            loop {
+                let line_start = position;
+                let mut line = String::new();
+                let bytes_read = match reader.read_line(&mut line) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        log_incident(&format!("[LOG ERROR] Failed reading monitored log: {}", e));
+                        break;
+                    }
+                };
+                if bytes_read == 0 {
                     break;
                 }
-            };
-
-            if bytes_read == 0 {
-                break;
-            }
-
-            if !line.ends_with('\n') {
-                position = line_start;
-                break;
-            }
-
-            position = line_start + bytes_read as u64;
-            let trimmed = line.trim();
-
-            if trimmed.contains("[ERROR]") || trimmed.contains("[CRITICAL]") {
-                process_incident(&rules, trimmed, &mut cooldowns);
+                if !line.ends_with('\n') {
+                    position = line_start;
+                    break;
+                }
+                position = line_start + bytes_read as u64;
+                let trimmed = line.trim();
+                if trimmed.contains("[ERROR]") || trimmed.contains("[CRITICAL]") {
+                    process_incident(&rules, trimmed, &mut cooldowns);
+                }
             }
         }
 
@@ -1197,6 +1178,7 @@ fn run_install() -> Result<(), String> {
     // First check beside the executable.
     if let Some(parent) = executable.parent() {
         rule_candidates.push(parent.join("rules.json"));
+        rule_candidates.push(parent.join("rules/builtin/rules.json"));
 
         // Then walk upward through the project directories.
         // This supports the normal Cargo layout:
@@ -1214,6 +1196,7 @@ fn run_install() -> Result<(), String> {
 
     // Finally check the directory from which the installer was launched.
     rule_candidates.push(PathBuf::from("rules.json"));
+    rule_candidates.push(PathBuf::from("rules/builtin/rules.json"));
 
     if let Some(source_rules) = rule_candidates.iter().find(|path| path.is_file()) {
         return install_from_rules(&executable, source_rules);
@@ -1270,6 +1253,36 @@ fn install_from_rules(executable: &Path, source_rules: &Path) -> Result<(), Stri
     Ok(())
 }
 
+fn run_configure(args: &[String]) -> Result<(), String> {
+    if unsafe { libc_geteuid() } != 0 {
+        return Err("Configuration must be run as root. Use sudo.".to_string());
+    }
+    if args.len() != 4 {
+        return Err("Usage: sudo aegira configure service <name> OR sudo aegira configure container <name>".to_string());
+    }
+    let kind = args[2].as_str();
+    let name = args[3].trim();
+    if name.is_empty() || name == "TARGET_SERVICE" || name == "TARGET_CONTAINER" {
+        return Err("Target name cannot be empty or a placeholder.".to_string());
+    }
+    let mut config = load_config()?;
+    match kind {
+        "service" => {
+            if normalize_target(name) == SELF_SERVICE {
+                return Err("Refusing to target Aegira itself.".to_string());
+            }
+            config.target_service = Some(name.to_string());
+            log_incident(&format!("[CONFIG] Target service configured: {}", name));
+        }
+        "container" => {
+            config.target_container = Some(name.to_string());
+            log_incident(&format!("[CONFIG] Target container configured: {}", name));
+        }
+        _ => return Err("Target type must be 'service' or 'container'.".to_string()),
+    }
+    save_config(&config)
+}
+
 fn run_status() -> Result<(), String> {
     let systemctl = systemctl_binary()?;
     let output = Command::new(systemctl)
@@ -1317,6 +1330,7 @@ fn main() {
     let result = match command {
         "install" => run_install(),
         "status" => run_status(),
+        "configure" => run_configure(&args),
         "show-rules" => {
             if let Err(e) = ensure_environment_setup() {
                 Err(e)
