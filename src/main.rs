@@ -1192,23 +1192,36 @@ fn run_install() -> Result<(), String> {
         .canonicalize()
         .map_err(|e| format!("Failed to resolve Aegira executable path: {}", e))?;
 
-    let source_rules = executable
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("rules.json");
+    let mut rule_candidates: Vec<PathBuf> = Vec::new();
 
-    if !source_rules.exists() {
-        let cwd_rules = Path::new("rules.json");
-        if cwd_rules.exists() {
-            return install_from_rules(&executable, cwd_rules);
+    // First check beside the executable.
+    if let Some(parent) = executable.parent() {
+        rule_candidates.push(parent.join("rules.json"));
+
+        // Then walk upward through the project directories.
+        // This supports the normal Cargo layout:
+        // project/rules.json
+        // project/target/release/aegira
+        let mut ancestor = parent;
+        while let Some(next) = ancestor.parent() {
+            if next == ancestor {
+                break;
+            }
+            rule_candidates.push(next.join("rules.json"));
+            ancestor = next;
         }
-        return Err(format!(
-            "Bundled rules.json was not found next to {}. Keep rules.json beside the Aegira binary when installing.",
-            executable.display()
-        ));
     }
 
-    install_from_rules(&executable, &source_rules)
+    // Finally check the directory from which the installer was launched.
+    rule_candidates.push(PathBuf::from("rules.json"));
+
+    if let Some(source_rules) = rule_candidates.iter().find(|path| path.is_file()) {
+        return install_from_rules(&executable, source_rules);
+    }
+
+    Err(format!(
+        "Bundled rules.json could not be found. Aegira checked beside the binary, its parent directories, and the current directory. Put rules.json in the project root and run the installer again."
+    ))
 }
 
 fn install_from_rules(executable: &Path, source_rules: &Path) -> Result<(), String> {
