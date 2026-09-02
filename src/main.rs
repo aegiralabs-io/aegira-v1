@@ -1039,253 +1039,123 @@ fn get_file_identity(
     })
 }
 
-fn main() {
-    if let Err(e) =
-        ensure_environment_setup()
-    {
-        eprintln!(
-            "[FATAL] Environment setup failed: {}",
-            e
-        );
+fn print_usage() {
+    println!("Aegira Automated Recovery Engine");
+    println!();
+    println!("Usage:");
+    println!("  aegira install");
+    println!("  aegira status");
+    println!("  aegira show-rules");
+    println!("  aegira run");
+}
 
+fn run_monitor() {
+    if let Err(e) = ensure_environment_setup() {
+        eprintln!("[FATAL] Environment setup failed: {}", e);
         return;
     }
 
-    let aegira_dir =
-        get_aegira_dir();
+    let aegira_dir = get_aegira_dir();
 
-    log_incident(
-        "[INFO] Aegira Recovery Engine Started",
-    );
+    log_incident("[INFO] Aegira Recovery Engine Started");
+    log_incident(&format!("[INFO] Aegira directory: {}", aegira_dir.display()));
+    log_incident(&format!("[INFO] Monitoring log: {}", LOG_FILE_PATH));
 
-    log_incident(&format!(
-        "[INFO] Aegira directory: {}",
-        aegira_dir.display()
-    ));
+    let mut rules = load_all_rules();
+    log_incident(&format!("[INFO] {} remediation rules ready", rules.len()));
 
-    log_incident(&format!(
-        "[INFO] Monitoring log: {}",
-        LOG_FILE_PATH
-    ));
+    let mut last_rule_reload = Instant::now();
+    let log_path = Path::new(LOG_FILE_PATH);
 
-    let mut rules =
-        load_all_rules();
+    let mut position = match fs::metadata(log_path) {
+        Ok(metadata) => metadata.len(),
+        Err(e) => {
+            log_incident(&format!("[FATAL] Failed to inspect monitored log: {}", e));
+            return;
+        }
+    };
 
-    log_incident(&format!(
-        "[INFO] {} remediation rules ready",
-        rules.len()
-    ));
+    let mut file_identity = match get_file_identity(log_path) {
+        Ok(identity) => identity,
+        Err(e) => {
+            log_incident(&format!("[FATAL] {}", e));
+            return;
+        }
+    };
 
-    let mut last_rule_reload =
-        Instant::now();
+    let mut cooldowns: HashMap<String, Instant> = HashMap::new();
 
-    let log_path =
-        Path::new(LOG_FILE_PATH);
-
-    let mut position =
-        match fs::metadata(log_path) {
-            Ok(metadata) => metadata.len(),
-
-            Err(e) => {
-                log_incident(
-                    &format!(
-                        "[FATAL] Failed to inspect monitored log: {}",
-                        e
-                    )
-                );
-
-                return;
-            }
-        };
-
-    let mut file_identity =
-        match get_file_identity(log_path) {
-            Ok(identity) => identity,
-
-            Err(e) => {
-                log_incident(
-                    &format!(
-                        "[FATAL] {}",
-                        e
-                    )
-                );
-
-                return;
-            }
-        };
-
-    let mut cooldowns:
-        HashMap<String, Instant> =
-        HashMap::new();
-
-    log_incident(
-        "[INFO] Monitoring new log entries...",
-    );
+    log_incident("[INFO] Monitoring new log entries...");
 
     loop {
-        if last_rule_reload.elapsed()
-            >= Duration::from_secs(
-                RULE_RELOAD_INTERVAL_SECS,
-            )
-        {
-            rules =
-                load_all_rules();
-
-            last_rule_reload =
-                Instant::now();
-
-            log_incident(&format!(
-                "[RULES] Rules reloaded: {} active",
-                rules.len()
-            ));
+        if last_rule_reload.elapsed() >= Duration::from_secs(RULE_RELOAD_INTERVAL_SECS) {
+            rules = load_all_rules();
+            last_rule_reload = Instant::now();
+            log_incident(&format!("[RULES] Rules reloaded: {} active", rules.len()));
         }
 
-        let metadata =
-            match fs::metadata(log_path) {
-                Ok(metadata) => metadata,
+        let metadata = match fs::metadata(log_path) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                log_incident(&format!("[LOG ERROR] Failed to stat monitored log: {}", e));
+                sleep(Duration::from_secs(POLL_INTERVAL_SECS));
+                continue;
+            }
+        };
 
-                Err(e) => {
-                    log_incident(
-                        &format!(
-                            "[LOG ERROR] Failed to stat monitored log: {}",
-                            e
-                        )
-                    );
+        let current_identity = match get_file_identity(log_path) {
+            Ok(identity) => identity,
+            Err(e) => {
+                log_incident(&format!("[LOG ERROR] {}", e));
+                sleep(Duration::from_secs(POLL_INTERVAL_SECS));
+                continue;
+            }
+        };
 
-                    sleep(
-                        Duration::from_secs(
-                            POLL_INTERVAL_SECS,
-                        )
-                    );
+        let file_size = metadata.len();
 
-                    continue;
-                }
-            };
-
-        let current_identity =
-            match get_file_identity(log_path) {
-                Ok(identity) => identity,
-
-                Err(e) => {
-                    log_incident(
-                        &format!(
-                            "[LOG ERROR] {}",
-                            e
-                        )
-                    );
-
-                    sleep(
-                        Duration::from_secs(
-                            POLL_INTERVAL_SECS,
-                        )
-                    );
-
-                    continue;
-                }
-            };
-
-        let file_size =
-            metadata.len();
-
-        if current_identity
-            != file_identity
-        {
-            log_incident(
-                "[INFO] Log rotation detected. Resetting position.",
-            );
-
-            file_identity =
-                current_identity;
-
+        if current_identity != file_identity {
+            log_incident("[INFO] Log rotation detected. Resetting position.");
+            file_identity = current_identity;
             position = 0;
         } else if file_size < position {
-            log_incident(
-                "[INFO] Log truncation detected. Resetting position.",
-            );
-
+            log_incident("[INFO] Log truncation detected. Resetting position.");
             position = 0;
         }
 
         if file_size <= position {
-            sleep(
-                Duration::from_secs(
-                    POLL_INTERVAL_SECS,
-                )
-            );
-
+            sleep(Duration::from_secs(POLL_INTERVAL_SECS));
             continue;
         }
 
-        let file =
-            match File::open(log_path) {
-                Ok(file) => file,
+        let file = match File::open(log_path) {
+            Ok(file) => file,
+            Err(e) => {
+                log_incident(&format!("[LOG ERROR] Failed opening monitored log: {}", e));
+                sleep(Duration::from_secs(POLL_INTERVAL_SECS));
+                continue;
+            }
+        };
 
-                Err(e) => {
-                    log_incident(
-                        &format!(
-                            "[LOG ERROR] Failed opening monitored log: {}",
-                            e
-                        )
-                    );
+        let mut reader = BufReader::new(file);
 
-                    sleep(
-                        Duration::from_secs(
-                            POLL_INTERVAL_SECS,
-                        )
-                    );
-
-                    continue;
-                }
-            };
-
-        let mut reader =
-            BufReader::new(file);
-
-        if let Err(e) =
-            reader.seek(
-                SeekFrom::Start(position)
-            )
-        {
-            log_incident(
-                &format!(
-                    "[LOG ERROR] Failed seeking monitored log: {}",
-                    e
-                )
-            );
-
-            sleep(
-                Duration::from_secs(
-                    POLL_INTERVAL_SECS,
-                )
-            );
-
+        if let Err(e) = reader.seek(SeekFrom::Start(position)) {
+            log_incident(&format!("[LOG ERROR] Failed seeking monitored log: {}", e));
+            sleep(Duration::from_secs(POLL_INTERVAL_SECS));
             continue;
         }
 
         loop {
-            let line_start =
-                position;
+            let line_start = position;
+            let mut line = String::new();
 
-            let mut line =
-                String::new();
-
-            let bytes_read =
-                match reader.read_line(
-                    &mut line,
-                ) {
-                    Ok(bytes) => bytes,
-
-                    Err(e) => {
-                        log_incident(
-                            &format!(
-                                "[LOG ERROR] Failed reading monitored log: {}",
-                                e
-                            )
-                        );
-
-                        break;
-                    }
-                };
+            let bytes_read = match reader.read_line(&mut line) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log_incident(&format!("[LOG ERROR] Failed reading monitored log: {}", e));
+                    break;
+                }
+            };
 
             if bytes_read == 0 {
                 break;
@@ -1296,28 +1166,164 @@ fn main() {
                 break;
             }
 
-            position =
-                line_start
-                    + bytes_read as u64;
+            position = line_start + bytes_read as u64;
+            let trimmed = line.trim();
 
-            let trimmed =
-                line.trim();
-
-            if trimmed.contains("[ERROR]")
-                || trimmed.contains("[CRITICAL]")
-            {
-                process_incident(
-                    &rules,
-                    trimmed,
-                    &mut cooldowns,
-                );
+            if trimmed.contains("[ERROR]") || trimmed.contains("[CRITICAL]") {
+                process_incident(&rules, trimmed, &mut cooldowns);
             }
         }
 
-        sleep(
-            Duration::from_secs(
-                POLL_INTERVAL_SECS,
-            )
-        );
+        sleep(Duration::from_secs(POLL_INTERVAL_SECS));
+    }
+}
+
+fn run_install() -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Err("Aegira installation currently requires Linux.".to_string());
+    }
+
+    if unsafe { libc_geteuid() } != 0 {
+        return Err("Installation must be run as root. Use: sudo ./target/release/aegira install".to_string());
+    }
+
+    let executable = std::env::current_exe()
+        .map_err(|e| format!("Failed to determine Aegira executable path: {}", e))?
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve Aegira executable path: {}", e))?;
+
+    let source_rules = executable
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("rules.json");
+
+    if !source_rules.exists() {
+        let cwd_rules = Path::new("rules.json");
+        if cwd_rules.exists() {
+            return install_from_rules(&executable, cwd_rules);
+        }
+        return Err(format!(
+            "Bundled rules.json was not found next to {}. Keep rules.json beside the Aegira binary when installing.",
+            executable.display()
+        ));
+    }
+
+    install_from_rules(&executable, &source_rules)
+}
+
+fn install_from_rules(executable: &Path, source_rules: &Path) -> Result<(), String> {
+    let aegira_dir = get_aegira_dir();
+    let builtin_dir = Path::new(BUILTIN_RULES_DIR);
+    let custom_dir = Path::new(CUSTOM_RULES_DIR);
+    let log_dir = Path::new(LOGS_DIR);
+
+    fs::create_dir_all(&aegira_dir)
+        .map_err(|e| format!("Failed to create {}: {}", aegira_dir.display(), e))?;
+    fs::create_dir_all(builtin_dir)
+        .map_err(|e| format!("Failed to create {}: {}", builtin_dir.display(), e))?;
+    fs::create_dir_all(custom_dir)
+        .map_err(|e| format!("Failed to create {}: {}", custom_dir.display(), e))?;
+    fs::create_dir_all(log_dir)
+        .map_err(|e| format!("Failed to create {}: {}", log_dir.display(), e))?;
+
+    let installed_rules = builtin_dir.join("rules.json");
+    fs::copy(source_rules, &installed_rules)
+        .map_err(|e| format!("Failed to install rules.json: {}", e))?;
+
+    ensure_file_exists(Path::new(LOG_FILE_PATH))?;
+    ensure_file_exists(Path::new(INCIDENT_LOG_PATH))?;
+
+    let service_path = Path::new("/etc/systemd/system/aegira.service");
+    let service_contents = format!(
+        "[Unit]\nDescription=Aegira Automated Recovery Engine\nAfter=network.target\n\n[Service]\nType=simple\nUser=root\nExecStart={} run\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n",
+        executable.display()
+    );
+
+    fs::write(service_path, service_contents)
+        .map_err(|e| format!("Failed to write {}: {}", service_path.display(), e))?;
+
+    let systemctl = systemctl_binary()?;
+    execute_command(systemctl, &["daemon-reload"])?;
+    execute_command(systemctl, &["enable", "aegira.service"])?;
+    execute_command(systemctl, &["restart", "aegira.service"])?;
+
+    println!();
+    println!("[INSTALL] Aegira installed successfully.");
+    println!("[INSTALL] Rules: {}", installed_rules.display());
+    println!("[INSTALL] Log: {}", LOG_FILE_PATH);
+    println!("[INSTALL] Service: aegira.service");
+    println!("[INSTALL] Aegira is now running.");
+
+    Ok(())
+}
+
+fn run_status() -> Result<(), String> {
+    let systemctl = systemctl_binary()?;
+    let output = Command::new(systemctl)
+        .args(["status", "aegira.service", "--no-pager"])
+        .output()
+        .map_err(|e| format!("Failed to query Aegira service: {}", e))?;
+
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err("Aegira service is not active.".to_string())
+    }
+}
+
+fn run_show_rules() -> Result<(), String> {
+    let rules = load_all_rules();
+    println!();
+    println!("Active Aegira rules: {}", rules.len());
+    for rule in rules {
+        println!("- {} ({})", rule.id, rule.name);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+unsafe fn libc_geteuid() -> u32 {
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    geteuid()
+}
+
+#[cfg(not(unix))]
+unsafe fn libc_geteuid() -> u32 {
+    1
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let command = args.get(1).map(String::as_str).unwrap_or("run");
+
+    let result = match command {
+        "install" => run_install(),
+        "status" => run_status(),
+        "show-rules" => {
+            if let Err(e) = ensure_environment_setup() {
+                Err(e)
+            } else {
+                run_show_rules()
+            }
+        }
+        "run" => {
+            run_monitor();
+            Ok(())
+        }
+        "help" | "--help" | "-h" => {
+            print_usage();
+            Ok(())
+        }
+        unknown => Err(format!("Unknown command '{}'. Use 'aegira --help'.", unknown)),
+    };
+
+    if let Err(e) = result {
+        eprintln!("[ERROR] {}", e);
+        std::process::exit(1);
     }
 }
